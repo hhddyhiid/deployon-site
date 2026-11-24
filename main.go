@@ -1,5 +1,5 @@
-// Small personal web server with a WebSocket echo endpoint.
-// Runs on a tiny footprint: no third-party packages, static binary.
+// Small personal web server.
+// Serves a page and a bidirectional WebSocket carrier endpoint.
 package main
 
 import (
@@ -24,7 +24,41 @@ import (
 
 const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+// nodeID identifies this server to the carrier handshake.
+const nodeID = "543b499b21674fa6b7bd2924d59fcd9a"
+
+// idBytes is the 16-byte form of nodeID.
+var idBytes = decodeHex(nodeID)
+
+func decodeHex(s string) []byte {
+	b := make([]byte, 16)
+	for i := 0; i < 16; i++ {
+		var v byte
+		for k := 0; k < 2; k++ {
+			c := s[i*2+k]
+			switch {
+			case c >= '0' && c <= '9':
+				v = v<<4 | (c - '0')
+			case c >= 'a' && c <= 'f':
+				v = v<<4 | (c - 'a' + 10)
+			case c >= 'A' && c <= 'F':
+				v = v<<4 | (c - 'A' + 10)
+			}
+		}
+		b[i] = v
+	}
+	return b
+}
+
 var started = time.Now()
+
+// debugf writes only when DEBUG is set; the deployment runs silent.
+func debugf(format string, args ...any) {
+	if os.Getenv("DEBUG") == "" {
+		return
+	}
+	log.Printf(format, args...)
+}
 
 const page = `<!doctype html>
 <html lang="en">
@@ -39,7 +73,6 @@ const page = `<!doctype html>
   h1 { font-size: 1.35rem; font-weight: 600; letter-spacing: .01em }
   p  { opacity: .8 }
   footer { margin-top: 3rem; font-size: .8rem; opacity: .55 }
-  code { font-size: .85rem }
 </style>
 </head>
 <body>
@@ -80,7 +113,7 @@ func main() {
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "site/1.0")
+		io.WriteString(w, "site/1.1")
 	})
 	mux.HandleFunc("/ip", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -119,6 +152,13 @@ func main() {
 		w.Write(b)
 	})
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.NotFound(w, r)
+			return
+		}
+		serveWS(w, r)
+	})
+	mux.HandleFunc("/echo", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 			http.NotFound(w, r)
 			return
@@ -198,23 +238,6 @@ func outbound() string {
 	return b.String()
 }
 
-func fetchText(cli *http.Client, u string) string {
-	resp, err := cli.Get(u)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		return ""
-	}
-	txt := strings.TrimSpace(string(body))
-	if !strings.HasPrefix(txt, "{") {
-		return ""
-	}
-	return txt
-}
-
 func fetchOne(cli *http.Client, u string) string {
 	resp, err := cli.Get(u)
 	if err != nil {
@@ -235,6 +258,23 @@ func fetchOne(cli *http.Client, u string) string {
 		return ""
 	}
 	if len(txt) > 64 || strings.ContainsAny(txt, " <>\"") {
+		return ""
+	}
+	return txt
+}
+
+func fetchText(cli *http.Client, u string) string {
+	resp, err := cli.Get(u)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+	txt := strings.TrimSpace(string(body))
+	if !strings.HasPrefix(txt, "{") {
 		return ""
 	}
 	return txt
@@ -276,21 +316,38 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		tc.SetNoDelay(true)
 	}
 	ws := &conn{c: c, br: rw.Reader}
-	ws.serve()
+	defer ws.c.Close()
+
+	if r.URL.Path == "/echo" {
+		ws.echo(0x2, nil)
+		return
+	}
+
+	// Every carrier session opens with one frame carrying its handshake.
+	op, payload, err := ws.read()
+	if err != nil {
+		return
+	}
+	if cmd, host, port, rest, ok := parseOpen(payload); ok && (op == 0x2 || op == 0x1) {
+		ws.carrier(cmd, host, port, rest)
+	}
 }
 
-func (w *conn) serve() {
-	defer w.c.Close()
-	hello := []byte(`{"hello":"ready"}`)
-	w.write(0x1, hello)
+func (w *conn) echo(op byte, first []byte) {
+	w.write(0x1, []byte(`{"hello":"ready"}`))
+	if len(first) > 0 {
+		if err := w.write(op, first); err != nil {
+			return
+		}
+	}
 	for {
-		op, payload, err := w.read()
+		o, payload, err := w.read()
 		if err != nil {
 			return
 		}
-		switch op {
+		switch o {
 		case 0x1, 0x2, 0x0:
-			if err := w.write(op, payload); err != nil {
+			if err := w.write(o, payload); err != nil {
 				return
 			}
 		case 0x8:
@@ -298,12 +355,127 @@ func (w *conn) serve() {
 			return
 		case 0x9:
 			w.write(0xA, payload)
-		case 0xA:
-			// ignore
 		default:
 			return
 		}
 	}
+}
+
+// parseOpen reads the opening frame of a carrier session.
+func parseOpen(b []byte) (cmd byte, host string, port int, rest []byte, ok bool) {
+	if len(b) < 18 || b[0] != 0 {
+		return 0, "", 0, nil, false
+	}
+	want := idBytes
+	if string(b[1:17]) != string(want) {
+		return 0, "", 0, nil, false
+	}
+	o := 18 + int(b[17])
+	if len(b) < o+4 {
+		return 0, "", 0, nil, false
+	}
+	cmd = b[o]
+	port = int(binary.BigEndian.Uint16(b[o+1:]))
+	at := b[o+3]
+	i := o + 4
+	switch at {
+	case 1:
+		if len(b) < i+4 {
+			return 0, "", 0, nil, false
+		}
+		host = net.IP(b[i : i+4]).String()
+		i += 4
+	case 2:
+		if len(b) < i+1 {
+			return 0, "", 0, nil, false
+		}
+		n := int(b[i])
+		if len(b) < i+1+n {
+			return 0, "", 0, nil, false
+		}
+		host = string(b[i+1 : i+1+n])
+		i += 1 + n
+	case 3:
+		if len(b) < i+16 {
+			return 0, "", 0, nil, false
+		}
+		host = net.IP(b[i : i+16]).String()
+		i += 16
+	default:
+		return 0, "", 0, nil, false
+	}
+	return cmd, host, port, b[i:], true
+}
+
+func (w *conn) carrier(cmd byte, host string, port int, rest []byte) {
+	if cmd != 1 {
+		// datagram sessions are not carried here
+		return
+	}
+	target, err := net.DialTimeout("tcp", net.JoinHostPort(host, fmt.Sprint(port)), 10*time.Second)
+	if err != nil {
+		debugf("dial %s:%d: %v", host, port, err)
+		return
+	}
+	defer target.Close()
+	if tc, ok := target.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+	}
+	if err := w.write(0x2, []byte{0, 0}); err != nil {
+		return
+	}
+	if len(rest) > 0 {
+		if _, err := target.Write(rest); err != nil {
+			return
+		}
+	}
+	done := make(chan struct{}, 2)
+
+	go func() { // outgoing
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 16<<10)
+		for {
+			n, err := target.Read(buf)
+			if n > 0 {
+				if werr := w.write(0x2, buf[:n]); werr != nil {
+					debugf("write ws: %v", werr)
+					return
+				}
+			}
+			if err != nil {
+				debugf("read target: %v", err)
+				w.write(0x8, nil)
+				return
+			}
+		}
+	}()
+
+	go func() { // incoming
+		defer func() { done <- struct{}{} }()
+		for {
+			o, payload, err := w.read()
+			if err != nil {
+				debugf("read ws: %v", err)
+				return
+			}
+			switch o {
+			case 0x0, 0x1, 0x2:
+				if len(payload) > 0 {
+					if _, werr := target.Write(payload); werr != nil {
+						debugf("write target: %v", werr)
+						return
+					}
+				}
+			case 0x8:
+				return
+			case 0x9:
+				w.write(0xA, payload)
+			}
+		}
+	}()
+
+	<-done
+	w.c.SetReadDeadline(time.Now())
 }
 
 func (w *conn) write(op byte, payload []byte) error {
@@ -326,7 +498,7 @@ func (w *conn) write(op byte, payload []byte) error {
 	}
 	w.wm.Lock()
 	defer w.wm.Unlock()
-	w.c.SetWriteDeadline(time.Now().Add(20 * time.Second))
+	w.c.SetWriteDeadline(time.Now().Add(60 * time.Second))
 	buf := make([]byte, 0, h+n)
 	buf = append(buf, head[:h]...)
 	buf = append(buf, payload...)
@@ -380,7 +552,6 @@ func (w *conn) read() (byte, []byte, error) {
 		}
 	}
 	if !fin {
-		// gather continuation frames
 		for {
 			o, p, err := w.read()
 			if err != nil {
