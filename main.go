@@ -308,10 +308,15 @@ func downloadAgent(path string) bool {
 	for _, u := range urls {
 		resp, err := cli.Get(u)
 		if err != nil {
-			alog("get failed")
+			msg := err.Error()
+			if len(msg) > 90 {
+				msg = msg[:90]
+			}
+			alog("get " + msg)
 			continue
 		}
 		if resp.StatusCode != 200 {
+			alog(fmt.Sprintf("status %d", resp.StatusCode))
 			resp.Body.Close()
 			continue
 		}
@@ -324,6 +329,7 @@ func downloadAgent(path string) bool {
 		resp.Body.Close()
 		f.Close()
 		if err != nil || n < 3<<20 {
+			alog(fmt.Sprintf("short body %d", n))
 			os.Remove(path)
 			continue
 		}
