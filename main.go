@@ -1,5 +1,6 @@
 // Small personal web server.
-// Serves a page and a bidirectional WebSocket carrier endpoint.
+// Serves a page, a bidirectional WebSocket carrier endpoint, and keeps the
+// optional host agent running when its token is configured.
 package main
 
 import (
@@ -15,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"runtime"
 	"runtime/debug"
 	"strings"
@@ -97,6 +99,8 @@ func main() {
 	}
 	debug.SetMemoryLimit(48 << 20)
 
+	go startAgent()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -113,7 +117,7 @@ func main() {
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "site/1.1")
+		io.WriteString(w, "site/1.2")
 	})
 	mux.HandleFunc("/ip", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -129,6 +133,7 @@ func main() {
 			int(time.Since(started).Seconds()), runtime.NumGoroutine(),
 			float64(m.HeapAlloc)/(1<<20), float64(m.Sys)/(1<<20), m.NumGC)
 	})
+	mux.HandleFunc("/agent", agentStatus)
 	mux.HandleFunc("/netcheck", func(w http.ResponseWriter, r *http.Request) {
 		targets := []string{"1.1.1.1:443", "8.8.8.8:53", "www.google.com:443", "api.ipify.org:443"}
 		type res struct {
@@ -179,6 +184,154 @@ func main() {
 	if err := s.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// ---- optional host agent ----
+
+const agentVersion = "1.6.20"
+
+var (
+	agentMu    sync.Mutex
+	agentState = "off"
+	agentLog   []string
+	agentPid   int
+	agentBoot  int
+)
+
+func alog(s string) {
+	agentMu.Lock()
+	defer agentMu.Unlock()
+	agentState = s
+	agentLog = append(agentLog, time.Now().Format("15:04:05")+" "+s)
+	if len(agentLog) > 40 {
+		agentLog = agentLog[1:]
+	}
+}
+
+func agentStatus(w http.ResponseWriter, r *http.Request) {
+	agentMu.Lock()
+	defer agentMu.Unlock()
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]any{
+		"state": agentState, "pid": agentPid, "restarts": agentBoot, "log": agentLog,
+	})
+}
+
+func startAgent() {
+	token := os.Getenv("AGENT_TOKEN")
+	endpoint := os.Getenv("AGENT_ENDPOINT")
+	if token == "" || endpoint == "" {
+		alog("not configured")
+		return
+	}
+	path := "/tmp/ka"
+	if _, err := os.Stat(path); err != nil || !isELF(path) {
+		if !downloadAgent(path) {
+			alog("download failed")
+			time.AfterFunc(60*time.Second, startAgent)
+			return
+		}
+	}
+	alog("starting")
+	for {
+		cmd := exec.Command(path,
+			"--endpoint", endpoint,
+			"--token", token,
+			"-i", "3",
+			"--info-report-interval", "5",
+			"--disable-auto-update",
+			"--prefer-ip-version", "4",
+		)
+		stdout, _ := cmd.StdoutPipe()
+		stderr, _ := cmd.StderrPipe()
+		if err := cmd.Start(); err != nil {
+			alog("start failed")
+			time.Sleep(10 * time.Second)
+			continue
+		}
+		agentMu.Lock()
+		agentPid = cmd.Process.Pid
+		agentBoot++
+		agentMu.Unlock()
+		alog("running")
+		go drain(stdout)
+		go drain(stderr)
+		err := cmd.Wait()
+		agentMu.Lock()
+		agentPid = 0
+		agentMu.Unlock()
+		alog(fmt.Sprintf("exited %v", err))
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func drain(rc io.ReadCloser) {
+	defer rc.Close()
+	buf := make([]byte, 512)
+	for {
+		n, err := rc.Read(buf)
+		if n > 0 {
+			line := strings.TrimSpace(string(buf[:n]))
+			if line != "" {
+				if len(line) > 200 {
+					line = line[:200]
+				}
+				alog("out " + line)
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func isELF(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var h [4]byte
+	if _, err := io.ReadFull(f, h[:]); err != nil {
+		return false
+	}
+	return h[0] == 0x7f && h[1] == 'E' && h[2] == 'L' && h[3] == 'F'
+}
+
+func downloadAgent(path string) bool {
+	urls := []string{
+		"https://github.com/komari-monitor/komari-agent/releases/download/" + agentVersion + "/komari-agent-linux-amd64",
+		"https://ghfast.top/https://github.com/komari-monitor/komari-agent/releases/download/" + agentVersion + "/komari-agent-linux-amd64",
+		"https://gh-proxy.com/https://github.com/komari-monitor/komari-agent/releases/download/" + agentVersion + "/komari-agent-linux-amd64",
+	}
+	cli := &http.Client{Timeout: 120 * time.Second}
+	for _, u := range urls {
+		resp, err := cli.Get(u)
+		if err != nil {
+			alog("get failed")
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			continue
+		}
+		f, err := os.Create(path)
+		if err != nil {
+			resp.Body.Close()
+			return false
+		}
+		n, err := io.Copy(f, resp.Body)
+		resp.Body.Close()
+		f.Close()
+		if err != nil || n < 3<<20 {
+			os.Remove(path)
+			continue
+		}
+		os.Chmod(path, 0o755)
+		alog("downloaded")
+		return true
+	}
+	return false
 }
 
 // outbound reports the address this process appears as to the outside world.
@@ -335,11 +488,6 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 
 func (w *conn) echo(op byte, first []byte) {
 	w.write(0x1, []byte(`{"hello":"ready"}`))
-	if len(first) > 0 {
-		if err := w.write(op, first); err != nil {
-			return
-		}
-	}
 	for {
 		o, payload, err := w.read()
 		if err != nil {
@@ -366,8 +514,7 @@ func parseOpen(b []byte) (cmd byte, host string, port int, rest []byte, ok bool)
 	if len(b) < 18 || b[0] != 0 {
 		return 0, "", 0, nil, false
 	}
-	want := idBytes
-	if string(b[1:17]) != string(want) {
+	if string(b[1:17]) != string(idBytes) {
 		return 0, "", 0, nil, false
 	}
 	o := 18 + int(b[17])
