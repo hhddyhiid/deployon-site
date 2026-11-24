@@ -117,7 +117,7 @@ func main() {
 	})
 	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		io.WriteString(w, "site/1.2")
+		io.WriteString(w, "site/1.3")
 	})
 	mux.HandleFunc("/ip", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
