@@ -224,6 +224,10 @@ func startAgent() {
 		alog("not configured")
 		return
 	}
+	alias := os.Getenv("AGENT_ENDPOINT")
+	if alias != "" {
+		alog("endpoint set")
+	}
 	path := "/tmp/ka"
 	if _, err := os.Stat(path); err != nil || !isELF(path) {
 		if !downloadAgent(path) {
@@ -299,6 +303,7 @@ func isELF(p string) bool {
 }
 
 func downloadAgent(path string) bool {
+	alog("begin")
 	urls := []string{
 		"https://github.com/komari-monitor/komari-agent/releases/download/" + agentVersion + "/komari-agent-linux-amd64",
 		"https://ghfast.top/https://github.com/komari-monitor/komari-agent/releases/download/" + agentVersion + "/komari-agent-linux-amd64",
