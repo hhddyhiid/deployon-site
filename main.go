@@ -7,12 +7,15 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -20,6 +23,8 @@ import (
 )
 
 const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+var started = time.Now()
 
 const page = `<!doctype html>
 <html lang="en">
@@ -81,6 +86,37 @@ func main() {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		io.WriteString(w, outbound())
+	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		fmt.Fprintf(w, `{"uptime_s":%d,"goroutines":%d,"heap_mb":%.2f,"sys_mb":%.2f,"num_gc":%d}`,
+			int(time.Since(started).Seconds()), runtime.NumGoroutine(),
+			float64(m.HeapAlloc)/(1<<20), float64(m.Sys)/(1<<20), m.NumGC)
+	})
+	mux.HandleFunc("/netcheck", func(w http.ResponseWriter, r *http.Request) {
+		targets := []string{"1.1.1.1:443", "8.8.8.8:53", "www.google.com:443", "api.ipify.org:443"}
+		type res struct {
+			Target string `json:"target"`
+			OK     bool   `json:"ok"`
+			MS     int64  `json:"ms"`
+		}
+		out := make([]res, 0, len(targets))
+		for _, t := range targets {
+			t0 := time.Now()
+			c, err := net.DialTimeout("tcp", t, 5*time.Second)
+			ms := time.Since(t0).Milliseconds()
+			if err == nil {
+				c.Close()
+			}
+			out = append(out, res{Target: t, OK: err == nil, MS: ms})
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		b, _ := json.Marshal(out)
+		w.Write(b)
 	})
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
