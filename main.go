@@ -153,7 +153,7 @@ func outbound() string {
 		b.WriteString(`"` + v + `"`)
 	}
 	b.WriteString(`],"info":`)
-	info := fetchText(cli, "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,org,as,query,proxy,hosting")
+	info := fetchText(cli, "http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,isp,org,as,query,hosting")
 	if info == "" {
 		info = "{}"
 	}
